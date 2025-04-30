@@ -1,0 +1,121 @@
+[
+  {
+    "objectID": "project2.html",
+    "href": "project2.html",
+    "title": "breast cancer prognostic model",
+    "section": "",
+    "text": "Building a predictive model for breast cancer prognostic model using R.\n在本案例中，我们基于乳腺癌患者的临床与病理数据，构建并评估多个预后模型。"
+  },
+  {
+    "objectID": "project2.html#原始数据分布检查",
+    "href": "project2.html#原始数据分布检查",
+    "title": "breast cancer prognostic model",
+    "section": "原始数据分布检查",
+    "text": "原始数据分布检查\n对全量数据做概览检查，包括摘要统计与缺失值分布，以便确定需处理的变量。"
+  },
+  {
+    "objectID": "project2.html#对数转换右偏变量",
+    "href": "project2.html#对数转换右偏变量",
+    "title": "breast cancer prognostic model",
+    "section": "对数转换右偏变量",
+    "text": "对数转换右偏变量\n针对 Tumor.Size 和 Regional.Node.Examined 两个右偏变量进行对数转换，以缓解偏态对分析的影响，并再次检验转换后数据分布。将转换后的数据按相同索引划分训练集与测试集。"
+  },
+  {
+    "objectID": "project2.html#基线特征",
+    "href": "project2.html#基线特征",
+    "title": "breast cancer prognostic model",
+    "section": "基线特征",
+    "text": "基线特征\n合并训练集和测试集，绘制基线特征对比表（Table 1），便于评估样本划分的均衡性。"
+  },
+  {
+    "objectID": "project2.html#检查连续变量与结局之间的线性关系样条曲线分析",
+    "href": "project2.html#检查连续变量与结局之间的线性关系样条曲线分析",
+    "title": "breast cancer prognostic model",
+    "section": "检查连续变量与结局之间的线性关系：样条曲线分析",
+    "text": "检查连续变量与结局之间的线性关系：样条曲线分析\n分别绘制 Age、log_Tumor.Size 和 log_Regional.Node.Examined 与生存结局之间的样条关系，探讨是否具有线性趋势。横轴为变量值，纵轴为风险或死亡概率，随时间变化。"
+  },
+  {
+    "objectID": "project2.html#构造模型矩阵并进行交叉验证",
+    "href": "project2.html#构造模型矩阵并进行交叉验证",
+    "title": "breast cancer prognostic model",
+    "section": "构造模型矩阵并进行交叉验证",
+    "text": "构造模型矩阵并进行交叉验证\n\n将字符型变量转换为因子并生成虚拟变量，构造X矩阵和Surv对象（结局变量）。\n利用 LASSO Cox 回归（glmnet）在训练集上进行交叉验证以选出最优惩罚参数 λ，并根据两种 λ 值拟合最终模型，输出系数。"
+  },
+  {
+    "objectID": "project2.html#shap分析及可视化",
+    "href": "project2.html#shap分析及可视化",
+    "title": "breast cancer prognostic model",
+    "section": "SHAP分析及可视化",
+    "text": "SHAP分析及可视化"
+  },
+  {
+    "objectID": "project2.html#lasso模型的时间依赖性roc",
+    "href": "project2.html#lasso模型的时间依赖性roc",
+    "title": "breast cancer prognostic model",
+    "section": "1 LASSO模型的时间依赖性ROC",
+    "text": "1 LASSO模型的时间依赖性ROC\n使用 timeROC 包评估LASSO模型在不同时间点（12至60个月）的预测能力，绘制时间依赖性ROC曲线。\n\n特定时间点的ROC曲线\n\n\n所有时间点的ROC曲线\n\n\n提取各时间点的AUC\n\n\nLASSO 模型的 Brier score评估\nBrier score用于评估生存概率预测的准确性。由于LASSO模型是通过glmnet拟合的，我们需将其等效转化为 Cox 模型进行Brier计算。"
+  },
+  {
+    "objectID": "project2.html#随机生存森林-rsf-模型的预测能力评估",
+    "href": "project2.html#随机生存森林-rsf-模型的预测能力评估",
+    "title": "breast cancer prognostic model",
+    "section": "2 随机生存森林 (RSF) 模型的预测能力评估",
+    "text": "2 随机生存森林 (RSF) 模型的预测能力评估\n在测试集上绘制时间依赖性ROC曲线，评估预测能力。\n\n获取生存概率\n\n\nRSF时间依赖性ROC曲线\n\n\n提取各时间点的AUC\n\n\nRSF模型的Brier score评估"
+  },
+  {
+    "objectID": "project2.html#lasso风险得分转化与cox模型拟合",
+    "href": "project2.html#lasso风险得分转化与cox模型拟合",
+    "title": "breast cancer prognostic model",
+    "section": "LASSO风险得分转化与Cox模型拟合",
+    "text": "LASSO风险得分转化与Cox模型拟合"
+  },
+  {
+    "objectID": "project2.html#lasso-模型的校准曲线12个月",
+    "href": "project2.html#lasso-模型的校准曲线12个月",
+    "title": "breast cancer prognostic model",
+    "section": "LASSO 模型的校准曲线（12个月）",
+    "text": "LASSO 模型的校准曲线（12个月）"
+  },
+  {
+    "objectID": "project2.html#生成lasso校准数据",
+    "href": "project2.html#生成lasso校准数据",
+    "title": "breast cancer prognostic model",
+    "section": "生成LASSO校准数据",
+    "text": "生成LASSO校准数据"
+  },
+  {
+    "objectID": "project2.html#rsf-模型的校准曲线12个月",
+    "href": "project2.html#rsf-模型的校准曲线12个月",
+    "title": "breast cancer prognostic model",
+    "section": "RSF 模型的校准曲线（12个月）",
+    "text": "RSF 模型的校准曲线（12个月）"
+  },
+  {
+    "objectID": "project2.html#rsf-模型的校准数据生成",
+    "href": "project2.html#rsf-模型的校准数据生成",
+    "title": "breast cancer prognostic model",
+    "section": "RSF 模型的校准数据生成",
+    "text": "RSF 模型的校准数据生成"
+  },
+  {
+    "objectID": "project2.html#合并lasso与rsf的校准数据",
+    "href": "project2.html#合并lasso与rsf的校准数据",
+    "title": "breast cancer prognostic model",
+    "section": "合并LASSO与RSF的校准数据",
+    "text": "合并LASSO与RSF的校准数据"
+  },
+  {
+    "objectID": "project2.html#smooth-curve",
+    "href": "project2.html#smooth-curve",
+    "title": "breast cancer prognostic model",
+    "section": "Smooth curve",
+    "text": "Smooth curve"
+  },
+  {
+    "objectID": "about.html",
+    "href": "about.html",
+    "title": "About",
+    "section": "",
+    "text": "About this site\n\n\n[1] 2"
+  }
+]

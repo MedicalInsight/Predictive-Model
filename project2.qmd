@@ -1,0 +1,769 @@
+---
+title: "breast cancer prognostic model"
+about:
+  id: hero-heading
+  template: trestles
+  image-shape: rectangle
+
+execute:
+  eval: false #不执行代码
+---
+
+::: {#hero-heading}
+Building a predictive model for breast cancer prognostic model using R.
+
+在本案例中，我们基于乳腺癌患者的临床与病理数据，构建并评估多个预后模型。
+:::
+
+# 一、数据预处理
+
+导入乳腺癌患者数据，并剔除存在共线性的变量。随后将数据集随机划分为训练集和测试集（比例约为3000:1607），确保两组数据互不重叠。
+
+```{r packages}
+#load packages
+# devtools::install_github("kunhuo/plotRCS",force = TRUE)
+#install.packages(c("survival","randomForestSRC"))
+#install.packages("ggRandomForests")
+#install.packages("timeROC")
+#install.packages("pec") 
+#install.packages("dcurves")
+#install.packages("hdnom")
+#install.packages("riskRegression")
+#install.packages("devtools")
+#devtools::install_github('yikeshu0611/ggDCA')
+
+library(devtools)
+library(ggDCA)
+library(ggplot2)
+library(openxlsx)
+library(MASS)
+library(summarytools)
+library(dplyr)
+library(rms)
+library(splines)
+library(plotRCS) 
+library(glmnet)
+library(tidyr)
+library(table1)
+library(pROC)
+library(xgboost)
+library(DiagrammeR)
+library(caret)
+library(boot)
+library(survival)
+library(randomForestSRC)
+library(ggRandomForests)
+library(timeROC)
+library(pec)
+library(dcurves) #DCA
+library(hdnom) #nomogram
+library(riskRegression)  #brier score
+```
+
+```{r data}
+#load df
+data_prog <- read.csv("Breast Cancer Prognosis.csv")
+
+#since there is colinearity between variables, delete X6th.Stage, A stage and Grade
+data_prog <- subset(data_prog,select = -c(X6th.Stage,A.Stage,Grade))
+
+#randomly seperate df into a training set and a test set
+set.seed(123)
+train <- sample(1:nrow(data_prog), size=3000, replace=FALSE)
+test <- setdiff(1:nrow(data_prog),train)
+
+training_set <- data_prog[train,]
+test_set <- data_prog[test,]
+
+intersect(training_set, test_set)  #N=0， no overlap between two sets
+```
+
+# 二、探索性数据分析
+
+## 原始数据分布检查
+
+对全量数据做概览检查，包括摘要统计与缺失值分布，以便确定需处理的变量。
+
+```{r summary}
+#check the distribution of dataset
+print(dfSummary(data_prog), method = "render")
+view(dfSummary(data_prog))
+```
+
+## 对数转换右偏变量
+
+针对 Tumor.Size 和 Regional.Node.Examined 两个右偏变量进行对数转换，以缓解偏态对分析的影响，并再次检验转换后数据分布。将转换后的数据按相同索引划分训练集与测试集。
+
+```{r data-trans}
+data_prog_trans <- data_prog
+#perform log-transfer to all righ skewed variables
+data_prog_trans$log_Tumor.Size <- log(data_prog_trans$Tumor.Size)
+data_prog_trans$log_Regional.Node.Examined <- log(data_prog_trans$Regional.Node.Examined)
+
+
+view(dfSummary(data_prog_trans))
+print(dfSummary(data_prog_trans),, method = "render")
+```
+
+```{r seperate}
+#seperate these transferred df into training and test sets
+training_set_trans <- data_prog_trans[train,]
+test_set_trans <- data_prog_trans[test,]
+```
+
+## 基线特征
+
+合并训练集和测试集，绘制基线特征对比表（Table 1），便于评估样本划分的均衡性。
+
+```{r baseline}
+training_set$group <- "training"
+test_set$group <- "test"
+data_prog_all <- rbind(training_set,test_set)
+table1(~Age + factor(Race) + factor(Marital.Status)+factor(T.Stage)+factor(N.Stage)+factor(differentiate)+Tumor.Size+factor(Estrogen.Status)+factor(Progesterone.Status)+Regional.Node.Examined+Survival.Months+factor(Status)|group, data = data_prog_all)
+```
+
+## 检查连续变量与结局之间的线性关系：样条曲线分析
+
+分别绘制 `Age`、`log_Tumor.Size` 和 `log_Regional.Node.Examined` 与生存结局之间的样条关系，探讨是否具有线性趋势。横轴为变量值，纵轴为风险或死亡概率，随时间变化。
+
+```{r rcsplot}
+training_set_trans_new <- training_set_trans[,!(names(training_set_trans) %in% c("ID","Tumor.Size","Regional.Node.Examined","Reginol.Node.Positive"))]
+
+training_set_trans_new$Status <-as.factor(training_set_trans_new$Status)
+training_set_trans_new$Status <-ifelse(training_set_trans_new$Status == "Alive",0,1)
+
+rcsplot(data = training_set_trans_new,
+        outcome = 'Status',
+        time = 'Survival.Months',
+        exposure = 'Age') 
+
+
+rcsplot(data = training_set_trans_new,
+        outcome = 'Status',
+        time = 'Survival.Months',
+        exposure = 'log_Tumor.Size') 
+
+rcsplot(data = training_set_trans_new,
+        outcome = 'Status',
+        time = 'Survival.Months',
+        exposure = 'log_Regional.Node.Examined')
+```
+
+# 三、构建LASSO Cox 回归模型
+
+本节基于训练集数据，使用LASSO方法进行变量筛选和Cox比例风险模型构建，用于预后预测。
+
+## 构造模型矩阵并进行交叉验证
+
+-   将字符型变量转换为因子并生成虚拟变量，构造X矩阵和Surv对象（结局变量）。
+
+-   利用 LASSO Cox 回归（`glmnet`）在训练集上进行交叉验证以选出最优惩罚参数 λ，并根据两种 λ 值拟合最终模型，输出系数。
+
+```{r lasso_model}
+#convert the character variables into factor variables
+training_set_trans_new[] <- lapply(training_set_trans_new, function(x) {
+  if (is.character(x)) {
+    return(as.factor(x))   
+  } else {
+    return(x)   
+  }
+})
+str(training_set_trans_new)
+
+#set a data matrix 
+candidate <- c("Age","Race","Marital.Status","T.Stage","N.Stage","differentiate","Estrogen.Status","Progesterone.Status","log_Tumor.Size","log_Regional.Node.Examined")
+
+#convert factor variables into dummy variables
+x <- model.matrix(~.-1 ,data = training_set_trans_new[,candidate])
+y<- Surv(training_set_trans_new$Survival.Months,training_set_trans_new$Status)
+
+#cross-validation to find the best lambda
+lasso_cv <-cv.glmnet(x,y,family="cox",alpha=1,nfolds = 10,type.measure = "C")  
+
+#measure = "C":C-INDEX is used for survival analysis, while AUC is more for binary problem
+
+best_lambda <-lasso_cv$lambda.min
+lambda_1se <- lasso_cv$lambda.1se
+cat("best lambda:",best_lambda,"\n")
+cat("lambda 1-SE:",lambda_1se,"\n")
+plot(lasso_cv)
+
+lasso_plot <- glmnet(x,y,family = "cox", alpha=1)
+plot(lasso_plot,xvar = "lambda",label = TRUE)
+
+#use the best lambda to fit the final model
+lasso_model <- glmnet(x,y,family = "cox", alpha=1, lambda = best_lambda)
+coefficients <- coef(lasso_model)
+print(coefficients)
+
+#lambda_1se
+lasso_model_se <- glmnet(x,y,family = "cox", alpha=1, lambda = lambda_1se)
+coefficients_se <- coef(lasso_model_se)
+print(coefficients_se)  # larger than best lambda and results to less coefficients
+
+```
+
+# 四、LASSO模型解释性分析（SHAP 值分析）
+
+由于Cox模型不直接预测生存时间或事件发生的概率，我们对 LASSO Cox 模型进行 SHAP 值分析，来估计变量对模型输出的解释强度和方向。
+
+## SHAP分析及可视化
+
+```{r shap-LASSO, cache=TRUE, eval=FALSE}
+#install.packages("kernelshap")
+#install.packages("shapviz")
+#install.packages("patchwork")
+library(kernelshap)
+library(shapviz)
+library(ggplot2)
+library(patchwork)
+
+#option 1
+s <- shapviz(kernelshap(lasso_model,x,bg_X = x))
+
+#option 2, seem not difference between option 1 and 2 ??
+#glmnet 训练出的 LASSO-Cox 并不是一个直接可预测的模型，Cox 模型的核心是估计风险比（Hazard Ratio），而不是直接预测生存时间或事件发生的概率。
+pred_fun <- function(model, X) {
+    predict(model, newx = X, type = "link")
+}
+bg_sample <- x[sample(1:nrow(x), 200), , drop = FALSE]  # 仅选200行
+s <- shapviz(kernelshap(lasso_model, x, bg_X = bg_sample, pred_fun = pred_fun))
+
+sv_importance(s,kind = "bee", show_numbers = TRUE)
+sv_dependence(s,colnames(x), color_var = NULL) & ylim(-4,4)
+sv_waterfall(s,row_id = 1)
+
+# Plot the average impact on model output magnitude
+importance_plot <- sv_importance(s, kind = "bar", show_numbers = TRUE)
+# Print or display the importance plot
+print(importance_plot)
+```
+
+# 五、构建随机生存森林 (RSF) 模型
+
+本节使用 `randomForestSRC` 包构建非参数的随机生存森林模型，对比 LASSO 模型的表现，并进行解释性分析。
+
+准备与LASSO模型相同的输入数据，拟合生存随机森林，并可视化变量重要性。
+
+```{r rsf_model}
+#prepare data file for rsf
+x <- model.matrix(~.-1 ,data = training_set_trans_new[,candidate])
+y<- Surv(training_set_trans_new$Survival.Months,training_set_trans_new$Status)
+
+data_rsf <- as.data.frame(x)
+data_rsf$Survival.Months <- training_set_trans_new$Survival.Months
+data_rsf$Status <- training_set_trans_new$Status
+
+#generate randomsurvivalforest model
+rsf_model <- rfsrc(Surv((Survival.Months),Status) ~., data = data_rsf,
+                   ntree =1000,
+                   importance = TRUE,
+                   nsplit = 10)
+print(rsf_model)
+plot(rsf_model)
+
+#check the importance of variables
+var_importance <- rsf_model$importance
+print(var_importance)
+
+plot(gg_vimp(rsf_model))
+```
+
+# 六、RSF模型的SHAP summary
+
+使用SHAP对RSF模型进行解释，与LASSO模型进行对比，分析变量对预测结果的影响。
+
+```{r shap-rsf, cache=TRUE, eval=FALSE}
+
+library(shapviz)
+
+x <- model.matrix(~.-1 ,data = training_set_trans_new[,candidate])
+y<- Surv(training_set_trans_new$Survival.Months,training_set_trans_new$Status)
+x_df <-as.data.frame(x)
+
+pred_output <- predict(rsf_model, x_df)
+str(pred_output$predicted)  #numeric 
+
+pred_fun <- function(model, X) {
+  predict(model, X)$predicted
+}
+
+bg_sample <- x_df[sample(1:nrow(x_df), 200), , drop = FALSE] 
+s <- shapviz(kernelshap(rsf_model, x_df, bg_X = bg_sample, pred_fun = pred_fun))
+
+#可视化
+sv_importance(s,kind = "bee", show_numbers = TRUE)
+sv_dependence(s,colnames(x), color_var = NULL) & ylim(-4,4)
+sv_waterfall(s,row_id = 1)
+
+# Plot the average impact on model output magnitude
+importance_plot <- sv_importance(s, kind = "bar", show_numbers = TRUE)
+# Print or display the importance plot
+print(importance_plot)
+```
+
+# 七、外部验证（测试集验证）
+
+模型在训练集拟合完成后，应当在独立的测试集上进行外部验证，以评估泛化性能。本节开始准备测试集数据，并将其应用于验证阶段。
+
+对测试集进行同样的虚拟变量转换，计算 LASSO-Cox 和 RSF 模型在不同时间点的时间依赖 ROC 曲线（AUC）和 Brier score，并分别绘图和输出 AUC 值。
+
+```{r data-matrix}
+#prepare the test_set
+test_set_trans_new <- test_set_trans[,!(names(test_set_trans) %in% c("ID","Tumor.Size","Regional.Node.Examined"))]
+
+test_set_trans_new$Status <-as.factor(test_set_trans_new$Status)
+test_set_trans_new$Status <- ifelse(test_set_trans_new$Status == "Alive",0,1)
+str(test_set_trans_new$Status)
+
+
+#set a data matrix 
+candidate <- c("Age","Race","Marital.Status","T.Stage","N.Stage","differentiate","Estrogen.Status","Progesterone.Status","log_Tumor.Size","log_Regional.Node.Examined")
+
+#convert factor variables into dummy variables
+x_test <- model.matrix(~.-1 ,data = test_set_trans_new[,candidate])
+times <- test_set_trans_new$Survival.Months
+status <- test_set_trans_new$Status
+y_test <-Surv(times,status)
+
+data_test <-as.data.frame(x_test)
+data_test$times <-test_set_trans_new$Survival.Months
+data_test$status <- test_set_trans_new$Status
+```
+
+## 1 LASSO模型的时间依赖性ROC
+
+使用 `timeROC` 包评估LASSO模型在不同时间点（12至60个月）的预测能力，绘制时间依赖性ROC曲线。
+
+```{r ROC-LASSO}
+##time dependent ROC curve
+time_points <- seq(12, 60, by = 12)  # 每隔 12 个月
+
+#calculate time dependent ROC for lasso model
+pred_prob_lasso <- predict(lasso_model, s = best_lambda, newx = x_test, type = "link")
+
+time_dependent_roc_lasso <- timeROC(
+  T = times,                 # 存活时间
+  delta = status,            # 生存状态 (0 或 1)
+  marker = pred_prob_lasso,  # 模型预测值
+  cause = 1,                 # 感兴趣的事件 (1 表示事件发生)
+  times = time_points,       # 感兴趣的时间点
+  iid = TRUE                 # 是否计算置信区间
+)
+```
+
+-   特定时间点的ROC曲线
+
+```{r ROC-spectime}
+# plot the ROC of specific time points
+# 创建空白绘图区域
+plot(0, 0, type = "n", xlab = "1 - Specificity", ylab = "Sensitivity", 
+     xlim = c(0, 1), ylim = c(0, 1), main = "Time-dependent ROC at 12 months")
+
+plot(time_dependent_roc_lasso, 
+     time = 12,               # 指定时间点
+     col = "blue",            # 线条颜色
+     add = TRUE)  
+
+```
+
+-   所有时间点的ROC曲线
+
+```{r ROC-alltime}
+#plot ROC for all timepoints in one plot
+# 创建空白绘图区域
+plot(0, 0, type = "n", xlab = "1 - Specificity", ylab = "Sensitivity", 
+     xlim = c(0, 1), ylim = c(0, 1), main = "Time-dependent ROC Curves")
+
+# 为每个时间点绘制 ROC 曲线
+colors <- rainbow(length(time_points))  # 使用不同颜色
+for (i in seq_along(time_points)) {
+  plot(time_dependent_roc_lasso, 
+       time = time_points[i], 
+       col = colors[i], 
+       add = TRUE)  # 添加到现有图中
+}
+
+# 添加图例
+legend("bottomright", 
+       legend = paste0("Time: ", time_points, " months"), 
+       col = colors, 
+       lty = 1, 
+       cex = 0.8)
+```
+
+### 提取各时间点的AUC
+
+```{r LASSO-AUC}
+# 提取每个时间点的 AUC
+auc_values <- time_dependent_roc_lasso$AUC
+print("AUC for each time point:")
+print(auc_values)
+
+```
+
+### LASSO 模型的 Brier score评估
+
+Brier score用于评估生存概率预测的准确性。由于LASSO模型是通过`glmnet`拟合的，我们需将其等效转化为 Cox 模型进行Brier计算。
+
+```{r Brier-LASSO}
+#Brier score: https://stat.ethz.ch/R-manual/R-devel/library/survival/html/brier.html
+# Since brier score need survival rate rather than HR to calculate, need to calculate the S(t) first
+#?? this brier is the new coxph, not lasso ??参考之前的case,根据validation script，lasso_model不能直接用score，要在refit一个coxph model.如果完全按照validation的做，连Lasso_survival()都没有的
+
+time_points <- seq(12, 60, by = 12)  # 每隔 12 个月
+
+#  选取 LASSO 变量并转换为 Cox 模型
+lasso_coefs <- coef(lasso_model)
+selected_vars <- rownames(lasso_coefs)[lasso_coefs[, 1] != 0]  # 选择非零系数变量
+
+# 确保变量名安全（避免因 `.` 或 `-` 出错）
+selected_vars <- paste0("`", selected_vars, "`")
+
+# 生成 CoxPH 公式
+cox_formula <- as.formula(paste("Surv(Survival.Months, Status) ~", paste(selected_vars, collapse = " + ")))
+
+# 拟合 CoxPH 模型
+cox_model <- coxph(cox_formula, data = data_rsf, x = TRUE)  #dummy variables
+
+# ️计算 LASSO-Cox 在测试集的生存概率
+surv_prob <- predictSurvProb(cox_model, newdata = data_test, times = time_points)
+
+# 计算 Brier Score
+brier_result <- pec(
+  object = list("LASSO-Cox" = surv_prob),  # 使用预测生存概率
+  formula = Surv(times, status) ~ 1,
+  data = data_test,
+  times = time_points,
+  exact = FALSE,
+  cens.model = "cox"  # 处理删失数据   
+)  ##依旧不行，request 1024*6，但明明只有5个时间点啊。怎么回事？？？？
+```
+
+## 2 随机生存森林 (RSF) 模型的预测能力评估 
+
+在测试集上绘制时间依赖性ROC曲线，评估预测能力。
+
+### 获取生存概率
+
+```{r rsf_predictions_survival}
+#rsf model
+
+time_points <- seq(12, 60, by = 12)  # 每隔 12 个月
+#calculate time dependent ROC for rsf model
+rsf_predictions <- predict(rsf_model, newdata = data_test,type="prob")
+rsf_predictions$predicted  #Cumulative hazard function (CHF) ,表示累计风险，值越大表示死亡风险越高。
+rsf_predictions$survival  #生存概率,即某个样本在不同时间点存活的概率，值在 [0,1] 之间。
+
+pred_probs_rsf <- sapply(time_points, function(t) {
+  rsf_predictions$survival[, which(rsf_predictions$time.interest == t)]
+})
+
+
+# 转换成矩阵，每列对应一个时间点的生存概率
+pred_probs_rsf_matrix <- as.matrix(pred_probs_rsf)
+
+times <- data_test$times  # 测试集生存时间
+status <- data_test$status          # 测试集生存状态
+```
+
+### RSF时间依赖性ROC曲线
+
+```{r time_dependent_roc_rsf}
+# 创建空白绘图区域
+plot(0, 0, type = "n", xlab = "1 - Specificity", ylab = "Sensitivity",
+     xlim = c(0, 1), ylim = c(0, 1), main = "Time-dependent ROC Curves (RSF)")
+
+# 不同时间点的 ROC 曲线
+colors <- rainbow(length(time_points))  # 不同时间点使用不同颜色
+
+# Initialize an empty vector to store AUC values
+auc_values <- numeric(length(time_points))
+
+for (i in seq_along(time_points)) {
+  # 计算 ROC 曲线
+  time_dependent_roc_rsf <- timeROC(
+    T = times,
+    delta = status,
+    marker = 1-pred_probs_rsf[, i],  # 每个时间点的预测值
+    cause = 1,
+    times = time_points[i],         # 当前时间点
+    iid = TRUE
+  )
+  
+  print(str(time_dependent_roc_rsf$AUC))
+  auc_values[i]<- time_dependent_roc_rsf$AUC[2]
+  # 绘制当前时间点的 ROC 曲线
+  plot(time_dependent_roc_rsf, time = time_points[i], col = colors[i], add = TRUE)
+
+}
+
+
+# 添加图例
+legend("bottomright", 
+       legend = paste0("Time: ", time_points, " months"), 
+       col = colors, 
+       lty = 1, 
+       cex = 0.8)
+```
+
+### 提取各时间点的AUC
+
+```{r AUC}
+###AUC and brier score
+print(auc_values)
+```
+
+### RSF模型的Brier score评估
+
+```{r Brier-score}
+##??? brier score??? refer to validation survival 
+#install.packages("caret")
+#install.packages("DescTools")
+library(caret)
+library(DescTools)
+
+rsf_predictions <- predict(rsf_model, newdata = data_test,type="prob")
+str(rsf_predictions)
+rsf_predictions$survival
+ls.str(rsf_predictions)
+
+brier_scores <- sapply(time_points, function(t) {
+  # 获取第t时间点的预测概率
+  predicted_probs <- 1- rsf_predictions$survival[, t]  # probability is the prebability of event (death),should be 1- survival
+  
+  actual_status <- data_test$status
+  
+  # 计算 Brier 分数
+  mean((predicted_probs - actual_status)^2)
+})
+print(brier_scores)  
+```
+
+# 八、外部验证：模型校准曲线 (Calibration Curve)
+
+校准曲线用于评估模型预测概率与真实生存情况的一致性。接下来将分别对 LASSO-Cox 和 RSF 模型在测试集上绘制校准曲线，然后将两者的 DCA 结果绘制对比。
+
+## LASSO风险得分转化与Cox模型拟合
+
+```{r cox_formula}
+#calibration curve
+# 计算 LASSO 预测的风险得分（log hazard）
+pred_risk_lasso <- predict(lasso_model, s = best_lambda, newx = x_test, type = "link")
+
+#因为lasso model和cox model不match，所以导致很多问题
+# 获取Cox模型的基准风险（baseline hazard）
+#  选取 LASSO 变量并转换为 Cox 模型
+lasso_coefs <- coef(lasso_model)
+selected_vars <- rownames(lasso_coefs)[lasso_coefs[, 1] != 0]  # 选择非零系数变量
+
+# 确保变量名安全（避免因 `.` 或 `-` 出错）
+selected_vars <- paste0("`", selected_vars, "`")
+
+# 生成 CoxPH 公式
+cox_formula <- as.formula(paste("Surv(Survival.Months, Status) ~", paste(selected_vars, collapse = " + ")))
+```
+
+## LASSO 模型的校准曲线（12个月）
+
+```{r cox_model}
+# 拟合 CoxPH 模型
+cox_model <- coxph(cox_formula, data = data_rsf, x = TRUE)  #dummy variable
+
+base_hazard <- basehaz(cox_model, centered = FALSE)
+
+# 计算每个个体的生存概率（12个月时）
+time_point <- 12
+base_hazard_12_months <- base_hazard$hazard[which.min(abs(base_hazard$time - time_point))]
+
+# 4. 计算每个个体的风险比
+hazard_ratio <- exp(pred_risk_lasso)  # 计算每个个体的死亡风险比
+
+# 计算每个个体在12个月时的生存概率
+# 基于Cox模型的生存概率公式 S(t) = exp(-H(t) * exp(β)) 
+# 其中 H(t) 是基准风险，β 是风险比
+survival_probability_12_lasso <- exp(-base_hazard_12_months * hazard_ratio)[,1]
+data_test_1 <- data_test
+data_test_1$survival_probability_12_lasso <- survival_probability_12_lasso
+
+
+# 计算所有患者在 12 个月时是否存活 (Kaplan-Meier)
+km_fit <- survfit(Surv(times, status) ~ 0, data = data_test)
+
+# 提取 12 个月时的生存概率
+survival_at_12_months <- summary(km_fit, times = 12)$surv
+data_test_1$survival_at_12_months <- survival_at_12_months
+```
+
+## 生成LASSO校准数据
+
+```{r calibration_lasso}
+# 将这些生存概率与实际状态进行比较，计算校准曲线
+calibration_lasso <- data_test_1 %>%
+  mutate(group = ntile(survival_probability_12_lasso, 10)) %>%  # 将预测值分为10组
+  group_by(group) %>%
+  summarise(
+    mean_predicted = mean(survival_probability_12_lasso),  # 每组的平均预测概率
+    observed_rate = summary(survfit(Surv(times, status) ~ 0), times = 12) $surv,               # 每组实际生存率,status_at_12 is the mortality rate at 12 month
+    se_observed = summary(survfit(Surv(times, status) ~ 0), times = 12)$std.err,      # 每组的标准误差
+    ci_lower_observed = observed_rate - qt(0.975, df = n() - 1) * se_observed,  # 置信区间下限
+    ci_upper_observed = observed_rate + qt(0.975, df = n() - 1) * se_observed   # 置信区间上限
+  )
+print(calibration_lasso)
+```
+
+## RSF 模型的校准曲线（12个月）
+
+```{r rsf-model}
+#rsf model
+
+# 预测生存概率
+rsf_predictions <- predict(rsf_model, newdata = data_test, type = "prob")
+
+# 提取所有患者在 12 个月时的生存概率
+time_point <- 12
+time_index <- which.min(abs(rsf_predictions$time.interest - time_point))  # 找到最接近12个月的时间点索引
+survival_probability_12_rsf <- rsf_predictions$survival[, time_index]  # 提取该时间点的生存概率
+
+# 把12个月的生存率加入到 data_test 数据框
+data_test_1$survival_probability_12_rsf <- survival_probability_12_rsf
+# 查看结果
+head(data_test_1$survival_probability_12)
+```
+
+## RSF 模型的校准数据生成
+
+```{r calibration_rsf}
+# 计算所有患者在 12 个月时是否存活 (Kaplan-Meier) 
+km_fit <- survfit(Surv(times, status) ~ 0, data = data_test)
+
+# 提取 12 个月时的生存概率
+survival_at_12_months <- summary(km_fit, times = 12)$surv
+data_test_1$survival_at_12_months<-survival_at_12_months
+
+# 计算 12 个月时每个患者的真实生存状态,
+
+calibration_rsf <- data_test_1 %>%
+  mutate(group = ntile(survival_probability_12_rsf, 10)) %>%  # 将预测值分为10组
+  group_by(group) %>%
+  summarise(
+    mean_predicted = mean(survival_probability_12_rsf),# 每组的平均预测概率
+    observed_rate = summary(survfit(Surv(times, status) ~ 0), times = 12) $surv,               # 每组实际生存率
+    se_observed = summary(survfit(Surv(times, status) ~ 0), times = 12)$std.err,      # 每组的标准误差
+    ci_lower_observed = observed_rate - qt(0.975, df = n() - 1) * se_observed,  # 置信区间下限
+    ci_upper_observed = observed_rate + qt(0.975, df = n() - 1) * se_observed   # 置信区间上限
+  )
+print(calibration_rsf)
+```
+
+## 合并LASSO与RSF的校准数据
+
+```{r CalibrationCurve}
+#combined two set
+calibration_lasso$model <- "lasso"
+calibration_rsf$model <- "rsf"
+calibration <- rbind(calibration_lasso,calibration_rsf)
+
+
+ggplot(calibration, aes(x = mean_predicted, y = observed_rate,color = model)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +  # 理想校准线
+  geom_errorbar(aes(ymin = ci_lower_observed, ymax = ci_upper_observed), 
+                width = 0.005, alpha = 0.7) + 
+  scale_color_manual(values = c("blue", "red"), labels = c("Lasso", "rsf")) +
+  theme_minimal() +
+  labs(title = "Calibration Curve for month 12", x = "Predicted Probability", y = "Observed Proportion")
+```
+
+## Smooth curve
+
+```{r Smooth-curve}
+#combined two set
+calibration_lasso$model <- "lasso"
+calibration_rsf$model <- "rsf"
+calibration <- rbind(calibration_lasso,calibration_rsf)
+
+
+ggplot(calibration, aes(x = mean_predicted, y = observed_rate,color = model)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +  # 理想校准线
+  geom_errorbar(aes(ymin = ci_lower_observed, ymax = ci_upper_observed), 
+                width = 0.005, alpha = 0.7) + 
+  scale_color_manual(values = c("blue", "red"), labels = c("Lasso", "rsf")) +
+  theme_minimal() +
+  labs(title = "Calibration Curve for month 12", x = "Predicted Probability", y = "Observed Proportion")
+```
+
+# 九、决策曲线分析 (DCA)
+
+DCA用于评估模型在不同风险阈值下的临床净获益，比较LASSO与RSF模型在临床决策支持中的表现。
+
+```{r DCA}
+##DCA 
+
+# month11
+
+dca_data <- data.frame(
+  observed = data_test_1$survival_at_12_months,    # the observed survival rate in test set
+  lasso = data_test_1$survival_probability_12_lasso,    # predicted outcome by lasso 
+  rsf = data_test_1$survival_probability_12_rsf # predicted outcome by rsf
+)
+
+
+dca_data$event_12 <- as.factor(ifelse(dca_data$observed > 0.5, 1, 0)) 
+str(dca_data)
+
+dca_result <- dca(
+  formula = event_12 ~ lasso + rsf,  # 使用公式传递目标变量和模型预测概率
+  data = dca_data,  # 数据框
+  threshold = seq(0, 1, by = 0.01)  # 设置不同的阈值
+)
+
+plot(dca_result,smooth = TRUE)
+```
+
+# 十、构建预后列线图 (Nomogram)
+
+::: callout-note
+列线图是一种可视化风险预测模型的重要工具，有助于临床医生进行个体化预测。
+:::
+
+在训练集上根据 LASSO 选择的变量重拟 CoxPH 模型，创建并绘制最终的 1/3/5 年生存列线图。
+
+```{r nomogram}
+#nomogram
+#https://cran.r-project.org/web/packages/hdnom/vignettes/hdnom.html
+
+
+dd <- datadist(training_set_trans_new)
+options(datadist = "dd")
+
+#extract the useful variables
+coefficients <- coef(lasso_model)
+print(coefficients)
+
+selected_vars <- which(coefficients !=0)
+selected_vars_names <- colnames(x)[selected_vars]
+
+cox_model <- cph(Surv(Survival.Months, Status) ~ Age + Race + Marital.Status + 
+                  T.Stage + N.Stage + differentiate + Estrogen.Status + 
+                  Progesterone.Status + log_Tumor.Size + log_Regional.Node.Examined,
+                  data = training_set_trans_new,surv = TRUE,x = TRUE, y = TRUE)
+
+
+# 定义预测时间点
+time_points <- c(12, 24, 36, 48, 60)
+
+# 创建Nomogram， function中的newdata有问题
+
+surv <- Survival(cox_model)
+nom <- nomogram(cox_model, fun=list(function(x) surv(12, x), function(x) surv(36, x),
+function(x) surv(60, x)), lp=F, funlabel=c("1-year survival", "3-year survival", "5-year survival"),
+maxscale=10, fun.at=c(0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.6, 0.5))
+plot(nom)
+
+# 绘制Nomogram
+plot(nom)
+```

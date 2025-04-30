@@ -1,0 +1,33 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  page-navigation: true
+  title: "Predictive model"
+  page-footer:
+    left: "&copy; Copyright 2025, Medical Insight"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Project 1
+      - href: project2.qmd
+        text: Project 2
+
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+    cross-references: true
+    lightbox: true   
+
+execute:
+  echo: false ##不显示代码
+
+editor: visual
+
+#启用 Quarto Lightbox 插件
+filters:
+  - lightbox
+

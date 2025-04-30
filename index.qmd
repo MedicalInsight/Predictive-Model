@@ -1,0 +1,558 @@
+---
+title: "Breast Cancer Diagnostic model"
+---
+
+# 一、介绍
+
+## 本案例展示了构建乳腺癌诊断模型的过程，包括数据预处理、建模、评估和可视化等步骤。
+
+# 二、数据预处理
+
+查看数据文件后，发现均值数据与诊断更相关，因此提取前12列数据用于后续建模，并将数据随机分为训练集和测试集，最后检查两者是否存在重叠，这里返回行数=0，表示无重叠。
+
+```{r, include=FALSE}
+library(ggplot2)
+library(openxlsx)
+library(MASS)
+library(summarytools)
+library(dplyr)
+library(rms)
+library(splines)
+library(plotRCS) 
+library(glmnet)  # for lasso logistic
+library(tidyr)
+library(table1)
+library(pROC)
+library(xgboost)  # for xgboost 
+library(rmda)
+library(DiagrammeR)
+library(caret)
+library(boot)
+library(iml) 
+library(SHAPforxgboost)
+library(shapper)
+library(DALEX)
+library(reticulate)
+library(iml)
+library(Matrix)
+library(xgboostExplainer)
+library(SHAPforxgboost)
+library(remotes)
+library(dcurves)
+
+#load datafile
+#load df
+data_diag <- read.csv("Breast Cancer Diagnosis.csv")
+
+# after reviewing the datafile, mean data are more related to diagnosis, then extract those data for prediction model
+data_all <- data_diag[,1:12]
+
+#randomly sperate df into a traning set and a test set
+set.seed(123)
+train <- sample(1:nrow(data_all), size=400, replace=FALSE)
+test <- setdiff(1:nrow(data_all),train)
+
+training_set <- data_all[train,]
+test_set <- data_all[test,]
+
+```
+
+```{r,results='hide'}
+#check if any overlap data between training and test sets
+intersect(training_set,test_set)  #row=0, no overlapped data
+```
+
+# 三、探索性数据分析
+
+首先检查所有变量的分布，预览如下。
+
+```{r}
+# check the distribution of variables in whole dataset
+print(dfSummary(data_all), method = "render")
+```
+
+对右偏的数值特征进行对数转换并将转换后的数据分为训练集与测试集（保持与原始划分一致）,转换后的变量分布如下。
+
+```{r}
+# Perform a log transformation on a right-skewed numeric variable
+data_all_trans <- data_all
+
+#check the variables by eyeballing one by one and add new column
+data_all_trans$log_area_mean <- log(data_all_trans$area_mean)
+
+data_all_trans$log_compactness_mean <- log(data_all_trans$compactness_mean +1 )
+#hist(log(data_all_trans$log_compactness_mean+1))
+
+data_all_trans$log_concavity_mean <- log(data_all_trans$concavity_mean +1) # distribution is still right skewed 
+#hist(log(data_all_trans$log_concavity_mean +1))
+
+data_all_trans$log_concave.points_mean <- log(data_all_trans$concave.points_mean +1) # distribution is still right skewed 
+#hist(data_all_trans$log_concave.points_mean)
+
+# print(dfSummary(data_all_trans), method = "viewer")  # plot in viewer
+print(dfSummary(data_all_trans), method = "render")  # knit to html
+
+#seperate the data_all_trans into training_trans and test_trans files
+training_set_trans <- data_all_trans[train,]
+test_set_trans <- data_all_trans[test,]
+```
+
+# 四、基线特征
+
+合并训练集和测试集，绘制基线特征对比表（Table 1）。
+
+```{r}
+# 合并训练集和测试集，并添加分组标识
+training_set$group <- "training"
+test_set$group     <- "test"
+data_all_new       <- rbind(training_set, test_set)
+
+# 绘制 Table 1：各组诊断及均值特征对比
+table1(
+  ~ factor(diagnosis) + radius_mean + texture_mean +
+    perimeter_mean + area_mean + smoothness_mean +
+    compactness_mean + concavity_mean +
+    concave.points_mean + symmetry_mean +
+    fractal_dimension_mean
+  | group,
+  data = data_all_new
+)
+```
+
+# 五、样条函数检验非线性关系
+
+在对数转换后训练集中，剔除部分原始变量，仅保留对数转换后的特征；将 `diagnosis` 转为 0/1 数值；依次对各个特征绘制受试者工作特征曲线（`rcsplot`），检验与诊断之间的非线性关系。
+
+```{r}
+#extract the useful data in training_set_trans and Keep the log converted variables and delete the original ones
+
+training_set_trans_new <-training_set_trans[,!(names(training_set_trans) %in% c("area_mean","compactness_mean","concavity_mean","concave.points_mean"))]
+
+#convert the diagnosis into factor variable with 1 or 0.
+training_set_trans_new$diagnosis <- as.factor(training_set_trans_new$diagnosis)
+training_set_trans_new$diagnosis <- ifelse(training_set_trans_new$diagnosis == "B",0,1)
+str(training_set_trans_new$diagnosis)
+
+#radius_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'radius_mean',ref.value = 
+          mean(training_set_trans_new$radius_mean))+xlim(10,20)+ylim(0,100) 
+
+
+#texture_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'texture_mean') 
+
+
+#perimeter_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'perimeter_mean')+ylim(0,100) 
+
+#log_area_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'log_area_mean')+ylim(0,100) 
+
+#smoothness_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'smoothness_mean')  
+
+#log_compactness_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'log_compactness_mean')  
+
+#log_concavity_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'log_concavity_mean')   
+
+#symmetry_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'symmetry_mean')  
+
+#fractal_dimension_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'fractal_dimension_mean')   
+
+#log_concave.points_mean
+rcsplot(data = training_set_trans_new,
+        outcome = 'diagnosis',
+        exposure = 'log_concave.points_mean')+ylim(0,100)
+
+```
+
+# 六、LASSO 逻辑回归模型构建
+
+在训练集上构建模型矩阵 `x` 和响应变量 `y`，使用 10 折交叉验证确定最佳惩罚参数 λ，然后基于最优 λ 拟合最终的 LASSO 逻辑回归模型，并输出系数。
+
+```{r}
+# set up the matrix for model,
+x <- model.matrix(diagnosis ~. -id,data = training_set_trans_new) 
+y <- training_set_trans_new$diagnosis
+
+set.seed(123)
+#cross-validation to find the best lambda
+lasso_cv <-cv.glmnet(x,y,family="binomial",alpha=1,nfolds = 10,type.measure = "auc")  
+
+best_lambda <-lasso_cv$lambda.min
+lambda_1se <- lasso_cv$lambda.1se
+cat("best lambda:",best_lambda,"\n")
+cat("lambda 1-SE:",lambda_1se,"\n")
+plot(lasso_cv)
+
+lasso_plot <- glmnet(x,y,family = "binomial", alpha=1)
+plot(lasso_plot,xvar = "lambda",label = TRUE)
+
+#use the best lambda to fit the final model
+lasso_model <- glmnet(x,y,family = "binomial", alpha=1, lambda = best_lambda)
+coefficients <- coef(lasso_model)
+print(coefficients)
+
+```
+
+# 七、LASSO 模型的 SHAP 值分析
+
+计算 LASSO 模型的 SHAP 值，绘制特征重要性柱状图（importance plot）。
+
+```{r, include=FALSE}
+library(kernelshap)
+library(shapviz)
+library(ggplot2)
+library(patchwork)
+s <- shapviz(kernelshap(lasso_model,x,bg_X = x))
+sv_importance(s,kind = "bee", show_numbers = TRUE)
+```
+
+```{r, include=FALSE}
+sv_dependence(s,colnames(x), color_var = NULL) & ylim(-4,4)
+```
+
+```{r, include=FALSE}
+sv_waterfall(s,row_id = 1)
+```
+
+```{r}
+# Plot the average impact on model output magnitude
+importance_plot <- sv_importance(s, kind = "bar", show_numbers = TRUE)
+# Print or display the importance plot
+print(importance_plot)
+```
+
+# 八、利用XGBoost构建预测模型
+
+在同一训练集上，构建 XGBoost 所需的数据矩阵，设置模型参数并训练 XGBoost 二分类模型，最后打印模型信息并绘制第一棵决策树。模型信息及参数如下。
+
+```{r}
+#set the data.matrix
+x <- model.matrix(diagnosis ~. -id,data = training_set_trans_new)
+y <- as.numeric(training_set_trans_new$diagnosis)
+str(training_set_trans_new$diagnosis)
+
+dtrain <- xgb.DMatrix(data = x, label = y)
+
+#set the coefficiences of xgboost
+params <- list (
+  booster = "gbtree",
+  objective ="binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  nthread =2
+)
+
+#train xgboost model
+model_xgb <- xgb.train(
+  params = params,
+  data = dtrain,
+  nround =100,
+  watchlist = list(train = dtrain),
+  print_every_n = 10
+)
+
+print(model_xgb)
+model_xgb$params
+xgb.plot.tree(model = model_xgb, trees = 0) 
+pred_prob_xgb <- predict(model_xgb,newdata = dtrain)
+```
+
+# 九、XGBoost的SHAP总结图
+
+计算并可视化 XGBoost 模型的 SHAP 总结图，以评估各特征的全局重要性和影响方向。
+
+```{r}
+#install.packages("SHAPforxgboost")
+library(SHAPforxgboost)
+
+x <- model.matrix(diagnosis ~. -id,data = training_set_trans_new)
+y <- as.numeric(training_set_trans_new$diagnosis)
+
+shap_values <- shap.values(xgb_model = model_xgb, X_train = x)
+mean_shap_score <- shap_values$mean_shap_score
+# 将 mean_shap_score 转换为数据框，方便 ggplot 使用
+shap_df <- data.frame(
+  feature = names(mean_shap_score),
+  mean_shap_value = mean_shap_score
+)
+
+# 按照 mean_shap_value 排序
+shap_df <- shap_df[order(shap_df$mean_shap_value, decreasing = TRUE), ]
+
+# 绘制条形图
+ggplot(shap_df, aes(x = reorder(feature, mean_shap_value), y = mean_shap_value)) +
+  geom_bar(stat = "identity", fill = "lightblue") +
+  coord_flip() +  # 横向排列条形图
+  labs(title = "Average Impact on Model Output (Mean SHAP Scores)",
+       x = "Features", y = "Mean SHAP Value") +
+  theme_minimal()
+
+
+#plot SHAP summary plot
+shap_long <- shap.prep(xgb_model = model_xgb, X_train = x)
+shap.plot.summary(shap_long)
+```
+
+# 十、外部验证：ROC 曲线与指标评估
+
+在独立测试集上，计算 LASSO 和 XGBoost 的预测概率，绘制 ROC 曲线并分别计算 AUC 和 Brier scores。
+
+```{r}
+#prepare the test_set
+test_set_trans_new <- test_set_trans[,!(names(test_set_trans) %in% c("area_mean","compactness_mean","concavity_mean","concave.points_mean"))]
+
+test_set_trans_new$diagnosis <- ifelse(test_set_trans_new$diagnosis == "B",0,1)
+str(test_set_trans_new$diagnosis)
+
+x_test <- model.matrix(diagnosis ~. -id,data = test_set_trans_new) 
+y_test <- as.numeric(test_set_trans_new$diagnosis)
+dtest <- xgb.DMatrix(data = x_test, label=y_test)
+```
+
+-   计算LASSO预测概率
+
+```{r}
+#ROC 
+#calculate ROC for lasso model
+test_set_trans_new$pred_prob_lasso <- predict(lasso_model,s=best_lambda,newx = x_test,type = "response")[, "s1"]
+roc_curve_lasso <- roc(y_test, test_set_trans_new$pred_prob_lasso)
+print(roc_curve_lasso)
+```
+
+-   计算XGBoost预测概率
+
+    ```{r}
+    #calculate ROC for xgboost model
+    test_set_trans_new$pred_prob_xgb <- predict(model_xgb,newdata = dtest)
+    roc_curve_xgb <- roc(y_test,test_set_trans_new$pred_prob_xgb)
+    ```
+
+-   ROC曲线
+
+    ```{r}
+    #convert ROC data to data.frame for ggplot
+    roc_data_lasso <- data.frame(
+      fpr = 1 - roc_curve_lasso$specificities,
+      tpr = roc_curve_lasso$sensitivities, 
+      model = "Lasso"
+    )
+
+    roc_data_xgb <- data.frame(
+      fpr = 1 - roc_curve_xgb$specificities,
+      tpr = roc_curve_xgb$sensitivities, 
+      model = "XGBoost"
+    )
+
+    #combine these two df
+    roc_data <- rbind(roc_data_lasso, roc_data_xgb)
+    roc_data <- roc_data[order(roc_data$fpr,roc_data$tpr),]
+
+
+    #plot ROC curve with ggplot2
+    ggplot(roc_data, aes(x = fpr, y = tpr, color = model)) +
+      geom_line(size = 1.0,alpha=0.5)+   #透明度
+      theme_minimal() +
+      labs(title = "ROC Curve", x = "False Positive Rate", y = "True Positive Rate") +
+      scale_color_manual(values = c("blue", "red"),labels = c("Lasso", "XGBoost")) +
+      theme(legend.title = element_blank()) +
+      geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray")
+    ```
+
+-   计算 AUC 和 Brier scores
+
+    ```{r}
+    ##calculate the AUC and brier scores
+    auc_value_lasso <- auc(roc_curve_lasso)
+    brier_score_lasso <- mean((test_set_trans_new$pred_prob_lasso - y_test)^2)
+    cat("AUC_lasso:",auc_value_lasso,"\n",
+        "Brier score_lasso:",brier_score_lasso,"\n")
+
+    auc_value_xgb <- auc(roc_curve_xgb)
+    brier_score_xgb<- mean((test_set_trans_new$pred_prob_xgb - y_test)^2)
+    cat("AUC_xgb:",auc_value_xgb,"\n",
+      "Brier score_xgb:",brier_score_xgb,"\n")
+    ```
+
+# 十一、校准曲线分析
+
+将测试集中预测概率分为十等分，对每一分组计算平均预测概率与实际发生率及其 95% 置信区间，并绘制校准曲线，包括分组点图和 LOESS 平滑曲线。
+
+-   分组校准曲线
+
+```{r}
+##calibration curve
+#lasso model
+calibration_lasso <- test_set_trans_new %>% 
+  mutate(group = ntile(pred_prob_lasso, 10)) %>%  # 分10组
+  group_by(group) %>%
+  summarise(
+    mean_predicted = mean(pred_prob_lasso),  # 每组的平均预测概率
+    observed_rate = mean(diagnosis), # 每组实际发生率
+    se_observed = sd(diagnosis)/sqrt(n()),  # 标准误差 for actual
+    ci_lower_observed = mean(diagnosis) - qt(0.975, df = n() - 1) * se_observed,  # 实际发生率的95%置信区间下限
+    ci_upper_observed = mean(diagnosis) + qt(0.975, df = n() - 1) * se_observed  # 实际发生率的95%置信区间上限
+  )
+
+#xgboost model
+calibration_xgb <- test_set_trans_new %>% 
+  mutate(group = ntile(pred_prob_xgb, 10)) %>%  # 分10组
+  group_by(group) %>%
+  summarise(
+    mean_predicted = mean(pred_prob_xgb),  # 每组的平均预测概率
+    observed_rate = mean(diagnosis), # 每组实际发生率
+    se_observed = sd(diagnosis)/sqrt(n()),  # 标准误差 for actual
+    ci_lower_observed = mean(diagnosis) - qt(0.975, df = n() - 1) * se_observed,  # 实际发生率的95%置信区间下限
+    ci_upper_observed = mean(diagnosis) + qt(0.975, df = n() - 1) * se_observed  # 实际发生率的95%置信区间上限
+  )
+
+
+calibration_lasso$model <- "lasso"
+calibration_xgb$model <- "xgb"
+calibration <- rbind(calibration_lasso,calibration_xgb)
+
+
+# 绘制校准曲线
+ggplot(calibration, aes(x = mean_predicted, y = observed_rate,color = model)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +  # 理想校准线
+  geom_errorbar(aes(ymin = ci_lower_observed, ymax = ci_upper_observed), 
+                width = 0.02, alpha = 0.7) + 
+  scale_color_manual(values = c("blue", "red"), labels = c("Lasso", "XGBoost")) +
+  theme_minimal() +
+  labs(title = "Calibration Curve", x = "Predicted Probability", y = "Observed Proportion")
+
+```
+
+-   LOESS 平滑校准曲线
+
+```{r}
+# smooth curve
+
+calibration_data_lasso <- data.frame(
+  observed = y_test,
+  predicted = test_set_trans_new$pred_prob_lasso,  # the predicted column name changed to s1 and can't convert
+  model = "Lasso"
+)
+
+calibration_data_xgb <- data.frame(
+  observed = y_test,
+  predicted = test_set_trans_new$pred_prob_xgb,
+  model = "XGBoost"
+)
+
+
+# Combine data frames
+calibration_data <- rbind(calibration_data_lasso, calibration_data_xgb)
+
+# Plot calibration curve
+ggplot(calibration_data, aes(x = predicted, y = observed, color = model)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(title = "Calibration Curve", x = "Predicted Probability", y = "Observed Probability") +
+  scale_color_manual(values = c("blue", "red"), labels = c("Lasso", "XGBoost")) +
+  theme_minimal() 
+```
+
+# 十二、决策曲线分析（Decision Curve Analysis）
+
+基于测试集的观察值和两种模型的预测概率，计算决策曲线，并可视化比较不同阈值下的净收益。
+
+```{r}
+##decision curve analysis
+dca_data <- data.frame(
+  observed = y_test,    # the observed outcome in test set
+  lasso = test_set_trans_new$pred_prob_lasso,    # predicted outcome by lasso 
+  xgboost = test_set_trans_new$pred_prob_xgb # predicted outcome by lasso
+)
+
+dca_result <- dca(
+  formula = observed ~ lasso + xgboost,  # 使用公式传递目标变量和模型预测概率
+  data = dca_data,  # 数据框
+  threshold = seq(0, 1, by = 0.01)  # 设置不同的阈值
+)
+
+plot(dca_result,smooth = TRUE)
+```
+
+# 十三、LASSO 模型列线图（Nomogram）
+
+从 LASSO 模型中提取非零系数对应的特征，基于选定特征在训练集上拟合 Logistic 回归模型，绘制列线图（Nomogram）展示对应变量的风险评分。
+
+```{r, include=FALSE}
+x <- model.matrix(diagnosis ~. -id, data=training_set_trans_new)
+y <- training_set_trans_new$diagnosis
+str(y)
+y <- as.factor(y)
+str(y)
+
+#first to select the useful predicted variable from lasso model
+lasso_coefficients <- coef(lasso_model)
+selected_features <- rownames(lasso_coefficients)[lasso_coefficients[,1]!=0][-1]
+print(selected_features)
+data_train_selected <- training_set_trans_new[, selected_features]
+initial_coef <- as.vector(lasso_coefficients[selected_features, 1])
+intercept <- as.vector(lasso_coefficients[1, 1]) 
+data_for_lrm <- data.frame(y = y, data_train_selected)
+ddist <- datadist(data_for_lrm)
+options(datadist = "ddist")
+
+# lrm_model ##
+lrm_model <- lrm(y ~ ., data = data_for_lrm, init = c(intercept, initial_coef), maxit = 0)  #the coefficience are total matched between lrm and lasso model
+
+nomogram <-nomogram(lrm_model,fun = function(x) exp(x)/(1 + exp(x)), funlabel = "Disease Risk")
+```
+
+-   simple plot
+
+    ```{r}
+    # simple plot
+    plot(nomogram,
+          col.grid = gray(c(0.8, 0.95)))  # 竖线颜色
+    ```
+
+-   polished plot
+
+    ```{r}
+    #polished plot
+    plot(nomogram, 
+         col.grid = c("red", "black"),  # 主刻度线为红色，次级刻度线为黑色
+         lty.grid = c(1, 2),            # 主刻度线为实线，次级刻度线为虚线
+         cex.var = 1.0,                 # 增加变量名称的字体大小
+         cex.axis = 1.0,                # 增加刻度标签的字体大小
+         cex.lab = 1.0,                 # 增加轴标签的字体大小
+         xfrac = 0.5                    # 增加标签与刻度线之间的距离
+    )
+
+    ```
+
+```{r}
+#save files
+save.image(file="Diagnostic.RData")
+```
